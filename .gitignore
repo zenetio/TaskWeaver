@@ -237,5 +237,8 @@ $RECYCLE.BIN/
 *.lnk
 
 
-# My projects
-my_prpjects/
+# Untrack the my_projects directory and its contents
+my_projects/
+my_projects/*
+!my_projects/.gitkeep
+
