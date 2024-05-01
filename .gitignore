@@ -236,3 +236,6 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
+
+# My projects
+my_prpjects/
