@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 from typing import List, Optional
@@ -8,11 +9,10 @@ from taskweaver.code_interpreter.plugin_selection import PluginSelector, Selecte
 from taskweaver.llm import LLMApi
 from taskweaver.llm.util import ChatMessageType, format_chat_message
 from taskweaver.logging import TelemetryLogger
-from taskweaver.memory import Attachment, Conversation, Memory, Post, Round, RoundCompressor
+from taskweaver.memory import Attachment, Memory, Post, Round, RoundCompressor
 from taskweaver.memory.attachment import AttachmentType
-from taskweaver.memory.experience import Experience, ExperienceGenerator
+from taskweaver.memory.experience import ExperienceGenerator
 from taskweaver.memory.plugin import PluginEntry, PluginRegistry
-from taskweaver.misc.example import load_examples
 from taskweaver.module.event_emitter import PostEventProxy, SessionEventEmitter
 from taskweaver.module.tracing import Tracing, tracing_decorator
 from taskweaver.role import PostTranslator, Role
@@ -25,19 +25,11 @@ class CodeGeneratorConfig(RoleConfig):
         self._set_name("code_generator")
         self.role_name = self._get_str("role_name", "ProgramApe")
         self.load_plugin = self._get_bool("load_plugin", True)
-        self.load_example = self._get_bool("load_example", True)
         self.prompt_file_path = self._get_path(
             "prompt_file_path",
             os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 "code_generator_prompt.yaml",
-            ),
-        )
-        self.example_base_path = self._get_path(
-            "example_base_path",
-            os.path.join(
-                self.src.app_base_path,
-                "codeinterpreter_examples",
             ),
         )
         self.prompt_compression = self._get_bool("prompt_compression", False)
@@ -53,8 +45,6 @@ class CodeGeneratorConfig(RoleConfig):
             False,
         )
         self.auto_plugin_selection_topk = self._get_int("auto_plugin_selection_topk", 3)
-
-        self.use_experience = self._get_bool("use_experience", False)
 
         self.llm_alias = self._get_str("llm_alias", default="", required=False)
 
@@ -74,6 +64,7 @@ class CodeGenerator(Role):
         experience_generator: ExperienceGenerator,
     ):
         super().__init__(config, logger, tracing, event_emitter)
+        self.config = config
         self.llm_api = llm_api
 
         self.role_name = self.config.role_name
@@ -87,14 +78,10 @@ class CodeGenerator(Role):
         self.user_message_head_template = self.prompt_data["user_message_head"]
         self.plugin_pool = plugin_registry.get_list()
         self.query_requirements_template = self.prompt_data["requirements"]
+        self.response_json_schema = json.loads(self.prompt_data["response_json_schema"])
 
-        self.examples = None
         self.code_verification_on: bool = False
         self.allowed_modules: List[str] = []
-
-        self.instruction = self.instruction_template.format(
-            ROLE_NAME=self.role_name,
-        )
 
         self.round_compressor: RoundCompressor = round_compressor
         self.compression_template = read_yaml(self.config.compression_prompt_path)["content"]
@@ -105,14 +92,7 @@ class CodeGenerator(Role):
             logger.info("Plugin embeddings loaded")
             self.selected_plugin_pool = SelectedPluginPool()
 
-        if self.config.use_experience:
-            self.experience_generator = experience_generator
-            self.experience_generator.refresh()
-            self.experience_generator.load_experience()
-            self.logger.info(
-                "Experience loaded successfully, "
-                "there are {} experiences".format(len(self.experience_generator.experience_list)),
-            )
+        self.experience_generator = experience_generator
 
         self.logger.info("CodeGenerator initialized successfully")
 
@@ -149,25 +129,37 @@ class CodeGenerator(Role):
             )
         return "\n".join(requirements)
 
+    def compose_sys_prompt(self, context: str):
+        return self.instruction_template.format(
+            ENVIRONMENT_CONTEXT=context,
+            ROLE_NAME=self.role_name,
+            RESPONSE_JSON_SCHEMA=json.dumps(self.response_json_schema),
+        )
+
+    def get_env_context(self):
+        # get date and time
+        now = datetime.datetime.now()
+        current_time = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        return f"- Current time: {current_time}"
+
     def compose_prompt(
         self,
         rounds: List[Round],
         plugins: List[PluginEntry],
-        selected_experiences: Optional[List[Experience]] = None,
+        planning_enrichments: Optional[List[str]] = None,
     ) -> List[ChatMessageType]:
-        experiences = (
-            self.experience_generator.format_experience_in_prompt(
-                self.prompt_data["experience_instruction"],
-                selected_experiences,
-            )
-            if self.config.use_experience
-            else ""
+        experiences = self.format_experience(
+            template=self.prompt_data["experience_instruction"],
         )
 
-        chat_history = [format_chat_message(role="system", message=f"{self.instruction}\n{experiences}")]
+        chat_history = [
+            format_chat_message(
+                role="system",
+                message=f"{self.compose_sys_prompt(context=self.get_env_context())}" f"\n{experiences}",
+            ),
+        ]
 
-        if self.examples is None:
-            self.examples = self.load_examples()
         for i, example in enumerate(self.examples):
             chat_history.extend(
                 self.compose_conversation(example.rounds, example.plugins, add_requirements=False),
@@ -189,12 +181,13 @@ class CodeGenerator(Role):
                 add_requirements=True,
                 summary=summary,
                 plugins=plugins,
+                planning_enrichments=planning_enrichments,
             ),
         )
         return chat_history
 
     def format_attachment(self, attachment: Attachment):
-        if attachment.type == AttachmentType.thought:
+        if attachment.type == AttachmentType.thought and "{ROLE_NAME}" in attachment.content:
             return attachment.content.format(ROLE_NAME=self.role_name)
         else:
             return attachment.content
@@ -205,8 +198,8 @@ class CodeGenerator(Role):
         plugins: List[PluginEntry],
         add_requirements: bool = False,
         summary: Optional[str] = None,
+        planning_enrichments: Optional[List[str]] = None,
     ) -> List[ChatMessageType]:
-        cur_round = rounds[-1]
         chat_history: List[ChatMessageType] = []
         ignored_types = [
             AttachmentType.revise_message,
@@ -237,17 +230,14 @@ class CodeGenerator(Role):
 
                 if post.send_from == "Planner" and post.send_to == self.alias:
                     # to avoid planner imitating the below handcrafted format,
-                    # we merge plan and query message in the code generator here
-                    user_query = conversation_round.user_query
-                    enrichment = f"The user request is: {user_query}\n\n"
+                    # we merge context information in the code generator here
+                    enrichment = ""
+                    if is_final_post:
+                        user_query = conversation_round.user_query
+                        enrichment = f"The user request is: {user_query}\n\n"
 
-                    supplementary_info_dict = cur_round.read_board()
-                    supplementary_info = "\n".join([bulletin for bulletin in supplementary_info_dict.values()])
-                    if supplementary_info != "":
-                        enrichment += (
-                            f"To better understand the user request, here is some additional information:\n"
-                            f" {supplementary_info}\n\n"
-                        )
+                        if planning_enrichments:
+                            enrichment += "Additional context:\n" + "\n".join(planning_enrichments) + "\n\n"
 
                     user_feedback = "None"
                     if last_post is not None and last_post.send_from == self.alias:
@@ -255,13 +245,13 @@ class CodeGenerator(Role):
 
                     user_message += self.user_message_head_template.format(
                         FEEDBACK=user_feedback,
-                        MESSAGE=f"{enrichment}{post.message}",
+                        MESSAGE=f"{enrichment}The task for this specific step is: {post.message}",
                     )
                 elif post.send_from == post.send_to == self.alias:
                     # for code correction
                     user_message += self.user_message_head_template.format(
                         FEEDBACK=format_code_feedback(post),
-                        MESSAGE=f"{post.get_attachment(AttachmentType.revise_message)[0]}",
+                        MESSAGE=f"{post.get_attachment(AttachmentType.revise_message)[0].content}",
                     )
 
                     assistant_message = self.post_translator.post_to_raw_text(
@@ -334,6 +324,7 @@ class CodeGenerator(Role):
         memory: Memory,
         post_proxy: Optional[PostEventProxy] = None,
         prompt_log_path: Optional[str] = None,
+        **kwargs: ...,
     ) -> Post:
         assert post_proxy is not None, "Post proxy is not provided."
 
@@ -353,12 +344,17 @@ class CodeGenerator(Role):
         if self.config.enable_auto_plugin_selection:
             self.plugin_pool = self.select_plugins_for_prompt(query)
 
-        if self.config.use_experience:
-            selected_experiences = self.experience_generator.retrieve_experience(query)
-        else:
-            selected_experiences = None
+        self.role_load_experience(query=query, memory=memory)
+        self.role_load_example(memory=memory, role_set={self.alias, "Planner"})
 
-        prompt = self.compose_prompt(rounds, self.plugin_pool, selected_experiences)
+        planning_enrichments = memory.get_shared_memory_entries(entry_type="plan")
+
+        prompt = self.compose_prompt(
+            rounds,
+            self.plugin_pool,
+            planning_enrichments=[pe.content for pe in planning_enrichments],
+        )
+
         self.tracing.set_span_attribute("prompt", json.dumps(prompt, indent=2))
         prompt_size = self.tracing.count_tokens(json.dumps(prompt))
         self.tracing.set_span_attribute("prompt_size", prompt_size)
@@ -370,7 +366,7 @@ class CodeGenerator(Role):
         )
 
         def early_stop(_type: AttachmentType, value: str) -> bool:
-            if _type in [AttachmentType.text, AttachmentType.python, AttachmentType.sample]:
+            if _type in [AttachmentType.reply_content]:
                 return True
             else:
                 return False
@@ -380,6 +376,7 @@ class CodeGenerator(Role):
                 prompt,
                 use_smoother=True,
                 llm_alias=self.config.llm_alias,
+                json_schema=self.response_json_schema,
             ),
             post_proxy=post_proxy,
             early_stop=early_stop,
@@ -387,20 +384,26 @@ class CodeGenerator(Role):
 
         post_proxy.update_send_to("Planner")
         generated_code = ""
+        reply_type: Optional[str] = None
         for attachment in post_proxy.post.attachment_list:
-            if attachment.type in [AttachmentType.sample, AttachmentType.text]:
-                post_proxy.update_message(attachment.content)
+            if attachment.type == AttachmentType.reply_type:
+                reply_type = attachment.content
                 break
-            elif attachment.type == AttachmentType.python:
-                generated_code = attachment.content
-                break
+        for attachment in post_proxy.post.attachment_list:
+            if attachment.type == AttachmentType.reply_content:
+                if reply_type == "python":
+                    generated_code = attachment.content
+                    break
+                elif reply_type == "text":
+                    post_proxy.update_message(attachment.content)
+                    break
 
         if self.config.enable_auto_plugin_selection:
             # filter out plugins that are not used in the generated code
             self.selected_plugin_pool.filter_unused_plugins(code=generated_code)
 
         if prompt_log_path is not None:
-            self.logger.dump_log_file(prompt, prompt_log_path)
+            self.logger.dump_prompt_file(prompt, prompt_log_path)
 
         self.tracing.set_span_attribute("code", generated_code)
 
@@ -416,38 +419,24 @@ class CodeGenerator(Role):
             )
         return ""
 
-    def load_examples(
-        self,
-    ) -> List[Conversation]:
-        if self.config.load_example:
-            return load_examples(
-                folder=self.config.example_base_path,
-                role_set={self.alias, "Planner"},
-            )
-        return []
-
     def get_plugin_pool(self) -> List[PluginEntry]:
         return self.plugin_pool
 
+    def format_code_revision_message(self) -> str:
+        return (
+            "The execution of the previous generated code has failed. "
+            "If you think you can fix the problem by rewriting the code, "
+            "please generate code and run it again.\n"
+            "Otherwise, please explain the problem to me."
+        )
 
-def format_code_revision_message() -> str:
-    return (
-        "The execution of the previous generated code has failed. "
-        "If you think you can fix the problem by rewriting the code, "
-        "please generate code and run it again.\n"
-        "Otherwise, please explain the problem to me."
-    )
-
-
-def format_output_revision_message() -> str:
-    return (
-        "Your previous message is not following the output format. "
-        "You must generate the output as a JSON object with the following format:\n"
-        '{"response": [{"type":"this is the type", "content": "this is the content"}, ...]}\n'
-        "You need at least have an element with type 'python' and content being the code to be executed.\n"
-        "Don't surround the JSON with ```json and ```, just send the JSON object directly.\n"
-        "Please try again."
-    )
+    def format_output_revision_message(self) -> str:
+        return (
+            "Your previous message is not following the output format. "
+            "You must generate the output as a JSON object following the schema provided:\n"
+            f"{self.response_json_schema}\n"
+            "Please try again."
+        )
 
 
 def format_code_feedback(post: Post) -> str:
@@ -456,13 +445,13 @@ def format_code_feedback(post: Post) -> str:
     execution_status = ""
     for attachment in post.attachment_list:
         if attachment.type == AttachmentType.verification and attachment.content == "CORRECT":
-            feedback += "## Verification\nI have verified that your code is CORRECT.\n"
+            feedback += "## Verification\nCode verification has been passed.\n"
             verification_status = "CORRECT"
         elif attachment.type == AttachmentType.verification and attachment.content == "NONE":
             feedback += "## Verification\nNo code verification.\n"
             verification_status = "NONE"
         elif attachment.type == AttachmentType.verification and attachment.content == "INCORRECT":
-            feedback += "## Verification\nYour code is INCORRECT with the following error:\n"
+            feedback += "## Verification\nCode verification detected the following issues:\n"
             verification_status = "INCORRECT"
         elif attachment.type == AttachmentType.code_error and verification_status == "INCORRECT":
             feedback += f"{attachment.content}\n"

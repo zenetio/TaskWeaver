@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import types
@@ -9,10 +10,10 @@ from injector import inject
 from taskweaver.llm import LLMApi
 from taskweaver.llm.util import ChatMessageType, format_chat_message
 from taskweaver.logging import TelemetryLogger
-from taskweaver.memory import Conversation, Memory, Post, Round, RoundCompressor
+from taskweaver.memory import Memory, Post, Round, RoundCompressor
 from taskweaver.memory.attachment import AttachmentType
-from taskweaver.memory.experience import Experience, ExperienceGenerator
-from taskweaver.misc.example import load_examples
+from taskweaver.memory.experience import ExperienceGenerator
+from taskweaver.memory.memory import SharedMemoryEntry
 from taskweaver.module.event_emitter import SessionEventEmitter
 from taskweaver.module.tracing import Tracing, tracing_decorator
 from taskweaver.role import PostTranslator, Role
@@ -23,20 +24,11 @@ from taskweaver.utils import read_yaml
 class PlannerConfig(RoleConfig):
     def _configure(self) -> None:
         self._set_name("planner")
-        app_dir = self.src.app_base_path
-        self.use_example = self._get_bool("use_example", True)
         self.prompt_file_path = self._get_path(
             "prompt_file_path",
             os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 "planner_prompt.yaml",
-            ),
-        )
-        self.example_base_path = self._get_path(
-            "example_base_path",
-            os.path.join(
-                app_dir,
-                "planner_examples",
             ),
         )
         self.prompt_compression = self._get_bool("prompt_compression", False)
@@ -47,8 +39,6 @@ class PlannerConfig(RoleConfig):
                 "compression_prompt.yaml",
             ),
         )
-
-        self.use_experience = self._get_bool("use_experience", False)
 
         self.llm_alias = self._get_str("llm_alias", default="", required=False)
 
@@ -70,6 +60,7 @@ class Planner(Role):
         experience_generator: Optional[ExperienceGenerator] = None,
     ):
         super().__init__(config, logger, tracing, event_emitter)
+        self.config = config
         self.alias = "Planner"
 
         self.llm_api = llm_api
@@ -81,14 +72,13 @@ class Planner(Role):
 
         self.prompt_data = read_yaml(self.config.prompt_file_path)
 
-        if self.config.use_example:
-            self.examples = self.get_examples()
-
         self.instruction_template = self.prompt_data["instruction_template"]
 
-        self.response_schema = self.prompt_data["planner_response_schema"]
-
-        self.instruction = self.compose_sys_prompt()
+        self.response_json_schema = json.loads(self.prompt_data["response_json_schema"])
+        # restrict the send_to field to the recipient alias set
+        self.response_json_schema["properties"]["response"]["properties"]["send_to"]["enum"] = list(
+            self.recipient_alias_set,
+        ) + ["User"]
 
         self.ask_self_cnt = 0
         self.max_self_ask_num = 3
@@ -96,33 +86,31 @@ class Planner(Role):
         self.round_compressor = round_compressor
         self.compression_prompt_template = read_yaml(self.config.compression_prompt_path)["content"]
 
-        if self.config.use_experience:
-            self.experience_generator = experience_generator
-            self.experience_generator.refresh()
-            self.experience_generator.load_experience()
-            self.logger.info(
-                "Experience loaded successfully, "
-                "there are {} experiences".format(len(self.experience_generator.experience_list)),
-            )
+        self.experience_generator = experience_generator
+        self.experience_loaded_from = None
 
         self.logger.info("Planner initialized successfully")
 
-    def compose_sys_prompt(self):
+    def compose_sys_prompt(self, context: str):
         worker_description = ""
         for alias, role in self.workers.items():
             worker_description += (
                 f"###{alias}\n"
                 f"- The name of this Worker is `{alias}`\n"
                 f"{role.get_intro()}\n"
-                f'- The input of {alias} will be prefixed with "{alias}:" in the chat history.\n\n'
+                f'- The message from {alias} will start with "From: {alias}"\n'
             )
 
         instruction = self.instruction_template.format(
-            planner_response_schema=self.response_schema,
+            environment_context=context,
+            response_json_schema=json.dumps(self.response_json_schema),
             worker_intro=worker_description,
         )
 
         return instruction
+
+    def format_message(self, role: str, message: str) -> str:
+        return f"From: {role}\nMessage: {message}\n"
 
     def compose_conversation_for_prompt(
         self,
@@ -145,6 +133,7 @@ class Planner(Role):
             for post in chat_round.post_list:
                 if post.send_from == self.alias:
                     if post.send_to == "User" or post.send_to in self.recipient_alias_set:
+                        # planner responses
                         planner_message = self.planner_post_translator.post_to_raw_text(
                             post=post,
                         )
@@ -154,62 +143,77 @@ class Planner(Role):
                                 message=planner_message,
                             ),
                         )
-                    elif (
-                        post.send_to == self.alias
-                    ):  # self correction for planner response, e.g., format error/field check error
+                    elif post.send_to == self.alias:
+                        # self correction for planner response, e.g., format error/field check error
+                        # append the invalid response to chat history
                         conversation.append(
                             format_chat_message(
                                 role="assistant",
                                 message=post.get_attachment(
                                     type=AttachmentType.invalid_response,
-                                )[0],
+                                )[0].content,
                             ),
-                        )  # append the invalid response to chat history
-                        conversation.append(
-                            format_chat_message(
-                                role="user",
-                                message="User: " + post.get_attachment(type=AttachmentType.revise_message)[0],
-                            ),
-                        )  # append the self correction instruction message to chat history
+                        )
 
-                else:
-                    if conv_init_message is not None:
-                        message = post.send_from + ": " + conv_init_message + "\n" + post.message
-                        conversation.append(
-                            format_chat_message(role="user", message=message),
-                        )
-                        conv_init_message = None
-                    else:
+                        # append the self correction instruction message to chat history
                         conversation.append(
                             format_chat_message(
                                 role="user",
-                                message=post.send_from + ": " + post.message,
+                                message=self.format_message(
+                                    role="User",
+                                    message=post.get_attachment(type=AttachmentType.revise_message)[0].content,
+                                ),
                             ),
                         )
+                else:
+                    # messages from user or workers
+                    conversation.append(
+                        format_chat_message(
+                            role="user",
+                            message=self.format_message(
+                                role=post.send_from,
+                                message=post.message
+                                if conv_init_message is None
+                                else conv_init_message + "\n" + post.message,
+                            ),
+                            image_urls=[
+                                attachment.extra["image_url"]
+                                for attachment in post.get_attachment(type=AttachmentType.image_url)
+                            ],
+                        ),
+                    )
+
+                    conv_init_message = None
 
         return conversation
+
+    def get_env_context(self) -> str:
+        # get the current time
+        now = datetime.datetime.now()
+        current_time = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        return f"- Current time: {current_time}"
 
     def compose_prompt(
         self,
         rounds: List[Round],
-        selected_experiences: Optional[List[Experience]] = None,
     ) -> List[ChatMessageType]:
-        experiences = (
-            self.experience_generator.format_experience_in_prompt(
-                self.prompt_data["experience_instruction"],
-                selected_experiences,
-            )
-            if self.config.use_experience
-            else ""
+        experiences = self.format_experience(
+            template=self.prompt_data["experience_instruction"],
         )
-        chat_history = [format_chat_message(role="system", message=f"{self.instruction}\n{experiences}")]
 
-        if self.config.use_example and len(self.examples) != 0:
-            for conv_example in self.examples:
-                conv_example_in_prompt = self.compose_conversation_for_prompt(
-                    conv_example.rounds,
-                )
-                chat_history += conv_example_in_prompt
+        chat_history = [
+            format_chat_message(
+                role="system",
+                message=f"{self.compose_sys_prompt(context=self.get_env_context())}" f"\n{experiences}",
+            ),
+        ]
+
+        for conv_example in self.examples:
+            conv_example_in_prompt = self.compose_conversation_for_prompt(
+                conv_example.rounds,
+            )
+            chat_history += conv_example_in_prompt
 
         summary = None
         if self.config.prompt_compression and self.round_compressor is not None:
@@ -235,32 +239,32 @@ class Planner(Role):
         self,
         memory: Memory,
         prompt_log_path: Optional[str] = None,
+        **kwargs: ...,
     ) -> Post:
         rounds = memory.get_role_rounds(role=self.alias)
         assert len(rounds) != 0, "No chat rounds found for planner"
 
         user_query = rounds[-1].user_query
+
         self.tracing.set_span_attribute("user_query", user_query)
         self.tracing.set_span_attribute("use_experience", self.config.use_experience)
 
-        if self.config.use_experience:
-            selected_experiences = self.experience_generator.retrieve_experience(user_query)
-        else:
-            selected_experiences = None
+        self.role_load_experience(query=user_query, memory=memory)
+        self.role_load_example(role_set=set(self.recipient_alias_set) | {self.alias, "User"}, memory=memory)
 
         post_proxy = self.event_emitter.create_post_proxy(self.alias)
 
         post_proxy.update_status("composing prompt")
-        chat_history = self.compose_prompt(rounds, selected_experiences)
+        chat_history = self.compose_prompt(rounds)
 
         def check_post_validity(post: Post):
-            missing_elements = []
-            validation_errors = []
-            if post.send_to is None or post.send_to == "Unknown":
+            missing_elements: List[str] = []
+            validation_errors: List[str] = []
+            if not post.send_to or post.send_to == "Unknown":
                 missing_elements.append("send_to")
             if post.send_to == self.alias:
                 validation_errors.append("The `send_to` field must not be `Planner` itself")
-            if post.message is None or post.message.strip() == "":
+            if not post.message or post.message.strip() == "":
                 missing_elements.append("message")
 
             attachment_types = [attachment.type for attachment in post.attachment_list]
@@ -281,6 +285,8 @@ class Planner(Role):
             chat_history,
             use_smoother=True,
             llm_alias=self.config.llm_alias,
+            json_schema=self.response_json_schema,
+            stream=True,
         )
 
         llm_output: List[str] = []
@@ -319,13 +325,15 @@ class Planner(Role):
             )
 
             plan = post_proxy.post.get_attachment(type=AttachmentType.plan)[0]
-            bulletin_message = (
-                f"I have drawn up a plan: \n{plan}\n\n"
-                f"Please proceed with this step of this plan: {post_proxy.post.message}"
-            )
+            bulletin_message = f"\n====== Plan ======\nI have drawn up a plan:\n{plan}\n==================\n"
             post_proxy.update_attachment(
-                message=bulletin_message,
-                type=AttachmentType.board,
+                type=AttachmentType.shared_memory_entry,
+                message="Add the plan to the shared memory",
+                extra=SharedMemoryEntry.create(
+                    type="plan",
+                    scope="round",
+                    content=bulletin_message,
+                ),
             )
 
         except (JSONDecodeError, AssertionError) as e:
@@ -352,7 +360,7 @@ class Planner(Role):
                 post_proxy.update_send_to(self.alias)
                 self.ask_self_cnt += 1
         if prompt_log_path is not None:
-            self.logger.dump_log_file(chat_history, prompt_log_path)
+            self.logger.dump_prompt_file(chat_history, prompt_log_path)
 
         reply_post = post_proxy.end()
         self.tracing.set_span_attribute("out.from", reply_post.send_from)
@@ -361,10 +369,3 @@ class Planner(Role):
         self.tracing.set_span_attribute("out.attachments", str(reply_post.attachment_list))
 
         return reply_post
-
-    def get_examples(self) -> List[Conversation]:
-        example_conv_list = load_examples(
-            self.config.example_base_path,
-            role_set=set(self.recipient_alias_set) | {self.alias, "User"},
-        )
-        return example_conv_list

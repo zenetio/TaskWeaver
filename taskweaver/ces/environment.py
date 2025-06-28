@@ -9,7 +9,7 @@ from ast import literal_eval
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from jupyter_client import BlockingKernelClient
+from jupyter_client.blocking.client import BlockingKernelClient
 from jupyter_client.kernelspec import KernelSpec, KernelSpecManager
 from jupyter_client.manager import KernelManager
 from jupyter_client.multikernelmanager import MultiKernelManager
@@ -111,14 +111,18 @@ class EnvMode(enum.Enum):
 
 
 class Environment:
+    DEFAULT_IMAGE = "taskweavercontainers/taskweaver-executor:latest"
+
     def __init__(
         self,
         env_id: Optional[str] = None,
         env_dir: Optional[str] = None,
         env_mode: Optional[EnvMode] = EnvMode.Local,
         port_start_inside_container: Optional[int] = 12345,
+        custom_image: Optional[str] = None,
     ) -> None:
         self.session_dict: Dict[str, EnvSession] = {}
+        self.client_dict: Dict[str, BlockingKernelClient] = {}
         self.id = get_id(prefix="env") if env_id is None else env_id
         self.env_dir = env_dir if env_dir is not None else os.getcwd()
         self.mode = env_mode
@@ -144,19 +148,27 @@ class Environment:
             except docker.errors.DockerException as e:
                 raise docker.errors.DockerException(f"Failed to connect to Docker daemon: {e}. ")
 
-            self.image_name = "taskweavercontainers/taskweaver-executor:latest"
-            try:
-                local_image = self.docker_client.images.get(self.image_name)
-                registry_image = self.docker_client.images.get_registry_data(self.image_name)
-                if local_image.id != registry_image.id:
-                    logger.info(f"Local image {local_image.id} does not match registry image {registry_image.id}.")
-                    raise docker.errors.ImageNotFound("Local image is outdated.")
-            except docker.errors.ImageNotFound:
-                logger.info("Pulling image from docker.io.")
+            if custom_image:
+                logger.info(f"Using custom image {custom_image}.")
+                self.image_name = custom_image
                 try:
-                    self.docker_client.images.pull(self.image_name)
-                except docker.errors.DockerException as e:
-                    raise docker.errors.DockerException(f"Failed to pull image: {e}. ")
+                    self.docker_client.images.get(self.image_name)
+                except docker.errors.ImageNotFound:
+                    raise docker.errors.ImageNotFound(f"Custom image {self.image_name} not found.")
+            else:
+                self.image_name = self.DEFAULT_IMAGE
+                try:
+                    local_image = self.docker_client.images.get(self.image_name)
+                    registry_image = self.docker_client.images.get_registry_data(self.image_name)
+                    if local_image.id != registry_image.id:
+                        logger.info(f"Local image {local_image.id} does not match registry image {registry_image.id}.")
+                        raise docker.errors.ImageNotFound("Local image is outdated.")
+                except docker.errors.ImageNotFound:
+                    logger.info("Pulling image from docker.io.")
+                    try:
+                        self.docker_client.images.pull(self.image_name)
+                    except docker.errors.DockerException as e:
+                        raise docker.errors.DockerException(f"Failed to pull image: {e}. ")
 
             self.session_container_dict: Dict[str, str] = {}
             self.port_start_inside_container = port_start_inside_container
@@ -186,13 +198,14 @@ class Environment:
         os.makedirs(cwd, exist_ok=True)
 
         if self.mode == EnvMode.Local:
-            # set python home from current python environment
-            python_home = os.path.sep.join(sys.executable.split(os.path.sep)[:-2])
+            import site
+
             python_path = os.pathsep.join(
                 [
+                    # package base directory
                     os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..")),
-                    os.path.join(python_home, "Lib", "site-packages"),
                 ]
+                + site.getsitepackages()
                 + sys.path,
             )
 
@@ -211,7 +224,6 @@ class Environment:
                     "CONNECTION_FILE": self._get_connection_file(session_id, new_kernel_id),
                     "PATH": os.environ["PATH"],
                     "PYTHONPATH": python_path,
-                    "PYTHONHOME": python_home,
                 },
             )
             session.kernel_id = self.multi_kernel_manager.start_kernel(
@@ -384,6 +396,7 @@ class Environment:
         session.session_var.update(session_var)
 
     def stop_session(self, session_id: str) -> None:
+        self._clean_client(session_id)
         session = self._get_session(session_id)
         if session is None:
             # session not exist
@@ -477,6 +490,8 @@ class Environment:
         self,
         session_id: str,
     ) -> BlockingKernelClient:
+        if session_id in self.client_dict:
+            return self.client_dict[session_id]
         session = self._get_session(session_id)
         connection_file = self._get_connection_file(session_id, session.kernel_id)
         client = BlockingKernelClient(connection_file=connection_file)
@@ -490,7 +505,15 @@ class Environment:
             client.hb_port = ports["hb_port"]
             client.control_port = ports["control_port"]
             client.iopub_port = ports["iopub_port"]
+        client.wait_for_ready(timeout=30)
+        client.start_channels()
+        self.client_dict[session_id] = client
         return client
+
+    def _clean_client(self, session_id: str):
+        if session_id in self.client_dict:
+            self.client_dict[session_id].stop_channels()
+            del self.client_dict[session_id]
 
     def _execute_code_on_kernel(
         self,
@@ -503,8 +526,6 @@ class Environment:
     ) -> EnvExecution:
         exec_result = EnvExecution(exec_id=exec_id, code=code, exec_type=exec_type)
         kc = self._get_client(session_id)
-        kc.wait_for_ready(timeout=30)
-        kc.start_channels()
         result_msg_id = kc.execute(
             code=code,
             silent=silent,
@@ -515,11 +536,16 @@ class Environment:
         try:
             # TODO: interrupt kernel if it takes too long
             while True:
-                message = kc.get_iopub_msg(timeout=180)
+                from taskweaver.utils.time_usage import time_usage
 
+                with time_usage() as time_msg:
+                    message = kc.get_iopub_msg(timeout=180)
+                logger.debug((f"Time: {time_msg.total:.2f} \t MsgType: {message['msg_type']} \t Code: {code}"))
                 logger.debug(json.dumps(message, indent=2, default=str))
 
-                assert message["parent_header"]["msg_id"] == result_msg_id
+                if message["parent_header"]["msg_id"] != result_msg_id:
+                    # skip messages not related to the current execution
+                    continue
                 msg_type = message["msg_type"]
                 if msg_type == "status":
                     if message["content"]["execution_state"] == "idle":
@@ -565,7 +591,7 @@ class Environment:
                 else:
                     pass
         finally:
-            kc.stop_channels()
+            pass
         return exec_result
 
     def _update_session_var(self, session: EnvSession) -> None:

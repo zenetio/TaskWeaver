@@ -14,8 +14,8 @@ rounds:
         - type: init_plan
           content: |-
                 1. load the data file
-                2. count the rows of the loaded data <sequentially depends on 1>
-                3. report the result to the user <interactively depends on 2>
+                2. count the rows of the loaded data <narrow depend on 1>
+                3. report the result to the user <wide depend on 2>
         - type: plan
           content: |-
             1. instruct CodeInterpreter to load the data file and count the rows of the loaded data
@@ -33,8 +33,8 @@ rounds:
           - type: init_plan
             content: |-
                 1. load the data file
-                2. count the rows of the loaded data <sequentially depends on 1>
-                3. report the result to the user <interactively depends on 2>
+                2. count the rows of the loaded data <narrow depend on 1>
+                3. report the result to the user <wide depend on 2>
           - type: plan
             content: |-
                 1. instruct CodeInterpreter to load the data file and count the rows of the loaded data

@@ -6,6 +6,7 @@ from taskweaver.code_interpreter import CodeInterpreter
 from taskweaver.code_interpreter.code_executor import CodeExecutor
 from taskweaver.config.config_mgt import AppConfigSource
 from taskweaver.logging import LoggingModule
+from taskweaver.memory import SharedMemoryEntry
 from taskweaver.memory.attachment import AttachmentType
 from taskweaver.memory.plugin import PluginModule
 from taskweaver.module.event_emitter import SessionEventEmitter
@@ -87,8 +88,16 @@ def test_compose_prompt():
         send_to="CodeInterpreter",
         attachment_list=[
             Attachment.create(
-                AttachmentType.board,
-                "1. load the data file\n2. count the rows of the loaded data <narrow depend on 1>\n",
+                AttachmentType.shared_memory_entry,
+                content="add shared memory entry",
+                extra=SharedMemoryEntry.create(
+                    type="plan",
+                    scope="round",
+                    content=(
+                        "1. load the data file\n2. count the rows of the loaded data <narrow depend on 1>\n"
+                        "3. report the result to the user <wide depend on 2>"
+                    ),
+                ),
             ),
         ],
     )
@@ -170,34 +179,38 @@ def test_compose_prompt():
     )
     assert "Arguments required: df: DataFrame, time_col_name: str, value_col_name: str" in messages[0]["content"]
     assert messages[1]["role"] == "user"
-    assert messages[1]["content"] == "User: Let's start the new conversation!\ncount the rows of /home/data.csv"
+    assert messages[1]["content"] == (
+        "From: User\n" "Message: Let's start the new conversation!\n" "count the rows of /home/data.csv\n"
+    )
     assert messages[2]["role"] == "assistant"
     assert messages[2]["content"] == (
-        '{"response": [{"type": "init_plan", "content": "1. load the data file\\n2. count the rows of the loaded data '
-        '<narrow depend on 1>\\n3. report the result to the user <wide depend on 2>"}, {"type": "plan", "content": "1. '
-        "instruct CodeInterpreter to load the data file and count the rows of the loaded data\\n2. report the result "
-        'to the user"}, {"type": "current_plan_step", "content": "1. instruct CodeInterpreter to load the data file '
-        'and count the rows of the loaded data"}, {"type": "send_to", "content": "CodeInterpreter"}, '
-        '{"type": "message", "content": "Please load the data file /home/data.csv and count the rows of the loaded '
-        'data"}]}'
+        '{"response": {"init_plan": "1. load the data file\\n2. count the rows of the '
+        "loaded data <narrow depend on 1>\\n3. report the result to the user <wide "
+        'depend on 2>", "plan": "1. instruct CodeInterpreter to load the data file '
+        'and count the rows of the loaded data\\n2. report the result to the user", '
+        '"current_plan_step": "1. instruct CodeInterpreter to load the data file and '
+        'count the rows of the loaded data", "send_to": "CodeInterpreter", "message": '
+        '"Please load the data file /home/data.csv and count the rows of the loaded '
+        'data"}}'
     )
     assert messages[3]["role"] == "user"
-    assert (
-        messages[3]["content"]
-        == "CodeInterpreter: Load the data file /home/data.csv successfully and there are 100 rows in the data file"
+    assert messages[3]["content"] == (
+        "From: CodeInterpreter\n"
+        "Message: Load the data file /home/data.csv successfully and there are 100 "
+        "rows in the data file\n"
     )
     assert messages[4]["role"] == "assistant"
-    assert (
-        messages[4]["content"]
-        == '{"response": [{"type": "init_plan", "content": "1. load the data file\\n2. count the rows of the loaded '
-        'data <narrow depend on 1>\\n3. report the result to the user <wide depend on 2>"}, {"type": "plan", '
-        '"content": "1. instruct CodeInterpreter to load the data file and count the rows of the loaded data\\n2. '
-        'report the result to the user"}, {"type": "current_plan_step", "content": "2. report the result to the '
-        'user"}, {"type": "send_to", "content": "User"}, {"type": "message", "content": "The data file '
-        '/home/data.csv is loaded and there are 100 rows in the data file"}]}'
+    assert messages[4]["content"] == (
+        '{"response": {"init_plan": "1. load the data file\\n2. count the rows of the '
+        "loaded data <narrow depend on 1>\\n3. report the result to the user <wide "
+        'depend on 2>", "plan": "1. instruct CodeInterpreter to load the data file '
+        'and count the rows of the loaded data\\n2. report the result to the user", '
+        '"current_plan_step": "2. report the result to the user", "send_to": "User", '
+        '"message": "The data file /home/data.csv is loaded and there are 100 rows in '
+        'the data file"}}'
     )
     assert messages[5]["role"] == "user"
-    assert messages[5]["content"] == "User: hello"
+    assert messages[5]["content"] == "From: User\nMessage: hello\n"
 
 
 def test_compose_example_for_prompt():
@@ -263,6 +276,8 @@ def test_compose_example_for_prompt():
     memory = Memory(session_id="session-1")
     memory.conversation.add_round(round1)
 
+    planner.role_load_example({"Planner", "CodeInterpreter", "User"}, memory)
+
     messages = planner.compose_prompt(rounds=memory.conversation.rounds)
 
     assert messages[0]["role"] == "system"
@@ -270,6 +285,8 @@ def test_compose_example_for_prompt():
         "You are the Planner who can coordinate Workers to finish the user task.",
     )
     assert messages[1]["role"] == "user"
-    assert messages[1]["content"] == "User: Let's start the new conversation!\ncount the rows of /home/data.csv"
+    assert messages[1]["content"] == (
+        "From: User\n" "Message: Let's start the new conversation!\n" "count the rows of /home/data.csv\n"
+    )
     assert messages[-1]["role"] == "user"
-    assert messages[-1]["content"] == "User: Let's start the new conversation!\nhello"
+    assert messages[-1]["content"] == "From: User\nMessage: Let's start the new conversation!\nhello\n"

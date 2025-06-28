@@ -1,4 +1,8 @@
-# How to evaluate a LLM agent?
+---
+title: How to evaluate a LLM agent?  
+authors: [liqli, xu]
+date: 2024-05-07  
+---
 
 ## The challenges
 It is nontrivial to evaluate the performance of a LLM agent. 
@@ -12,6 +16,8 @@ It is sometimes hard to use keywords matching to evaluate the output of the agen
 For example, if the answer is a date or a number, the evaluation method may not be able to handle the different formats.
 Moreover, the evaluation method should be able to act more like a human, who can understand the context and the meaning of the output.
 For example, when different agents are asked to perform the same task, they may behave differently, but still produce correct outputs.
+
+<!-- truncate -->
 
 The below example illustrates this point:
 
@@ -32,9 +38,13 @@ However, both agents provide the correct answer to the question.
 But if the evaluation method takes the agent as a function, it may not be able to handle the different behaviors of the agents 
 and consider Agent 2 as incorrect (as the first response does not match the ground truth, e.g., "sunny").
 
+
 ## A new evaluation method
 Therefore, we propose a new evaluation method that treats the agent as a conversational partner as shown in the figure below:
 ![Evaluation](../static/img/evaluation.png)
+
+<!-- truncate -->
+
 We introduce two new roles during the evaluation process: the **Examiner** and the **Judge**.
 For each test case, the task description is first given to the Examiner.
 The Examiner then asks questions to the agent and supervises the conversation.

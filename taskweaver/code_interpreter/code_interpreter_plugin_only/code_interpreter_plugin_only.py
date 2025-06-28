@@ -55,7 +55,7 @@ class CodeInterpreterPluginOnly(Role, Interpreter):
 
     def get_intro(self) -> str:
         return self.intro.format(plugin_description=self.plugin_description)
-    
+
     def update_session_variables(self, session_variables: dict) -> None:
         self.executor.update_session_var(session_variables)
 
@@ -64,8 +64,10 @@ class CodeInterpreterPluginOnly(Role, Interpreter):
         self,
         memory: Memory,
         prompt_log_path: Optional[str] = None,
+        **kwargs: ...,
     ) -> Post:
         post_proxy = self.event_emitter.create_post_proxy(self.alias)
+        self.executor.start()
         self.generator.reply(
             memory,
             post_proxy=post_proxy,
@@ -76,7 +78,7 @@ class CodeInterpreterPluginOnly(Role, Interpreter):
             return post_proxy.end()
 
         functions = json.loads(
-            post_proxy.post.get_attachment(type=AttachmentType.function)[0],
+            post_proxy.post.get_attachment(type=AttachmentType.function)[0].content,
         )
         if len(functions) > 0:
             code: List[str] = []

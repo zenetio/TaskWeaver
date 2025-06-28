@@ -41,26 +41,31 @@ class CodeInterpreterCLIOnly(Role, Interpreter):
         self.return_index = 0
 
         self.logger.info(f"{self.alias} initialized successfully.")
-        
+
     def update_session_variables(self, session_variables: dict) -> None:
         assert False, "Not implemented"
-        
+
     @tracing_decorator
     def reply(
         self,
         memory: Memory,
         prompt_log_path: Optional[str] = None,
+        **kwargs: ...,
     ) -> Post:
         post_proxy = self.event_emitter.create_post_proxy(self.alias)
+        self.executor.start()
         self.generator.reply(
             memory,
             post_proxy=post_proxy,
             prompt_log_path=prompt_log_path,
         )
 
-        code = post_proxy.post.get_attachment(type=AttachmentType.python)[0]
+        code = post_proxy.post.get_attachment(type=AttachmentType.reply_content)[0].content
         if len(code) == 0:
-            post_proxy.update_message(post_proxy.post.get_attachment(type=AttachmentType.thought)[0], is_end=True)
+            post_proxy.update_message(
+                post_proxy.post.get_attachment(type=AttachmentType.thought)[0].content,
+                is_end=True,
+            )
             return post_proxy.end()
 
         code_to_exec = "! " + code

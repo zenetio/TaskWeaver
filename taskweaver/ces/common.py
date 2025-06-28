@@ -4,9 +4,10 @@ import dataclasses
 import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
-from taskweaver.plugin.context import ArtifactType
+if TYPE_CHECKING:
+    from taskweaver.plugin.context import ArtifactType
 
 
 @dataclass
@@ -104,6 +105,9 @@ class Client(ABC):
         ...
 
 
+KernelModeType = Literal["local", "container"]
+
+
 class Manager(ABC):
     """
     Manager is the interface for the execution manager.
@@ -128,5 +132,5 @@ class Manager(ABC):
         ...
 
     @abstractmethod
-    def get_kernel_mode(self) -> Literal["local", "container"] | None:
+    def get_kernel_mode(self) -> KernelModeType:
         ...
